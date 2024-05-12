@@ -484,7 +484,7 @@ func (d *Drain) MarshalJSON() ([]byte, error) {
 	clusters := []*LogCluster{}
 	clusters = append(clusters, d.IdToCluster.Values()...)
 
-	return json.Marshal(&drainForJson{
+	return json.Marshal(&SerializableDrain{
 		LogClusterDepth:          d.LogClusterDepth,
 		MaxNodeDepth:             d.MaxNodeDepth,
 		SimTh:                    d.SimTh,
@@ -501,7 +501,7 @@ func (d *Drain) MarshalJSON() ([]byte, error) {
 }
 
 func (d *Drain) UnmarshalJSON(data []byte) error {
-	var forJson drainForJson
+	var forJson SerializableDrain
 	err := json.Unmarshal(data, &forJson)
 	if err != nil {
 		return err
@@ -527,7 +527,7 @@ func (d *Drain) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type drainForJson struct {
+type SerializableDrain struct {
 	LogClusterDepth          int64
 	MaxNodeDepth             int64
 	SimTh                    float64
