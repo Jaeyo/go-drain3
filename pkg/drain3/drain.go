@@ -188,9 +188,10 @@ func (d *Drain) treeSearch(rootNode *Node, tokens []string, simTh float64, inclu
 			break
 		}
 
-		currentNode, exist = currentNode.KeyToChildNode[token]
+		keyToChildNode := currentNode.KeyToChildNode
+		currentNode, exist = keyToChildNode[token]
 		if !exist { // no exact next token exist, try wildcard node
-			currentNode, exist = currentNode.KeyToChildNode[d.ParamStr]
+			currentNode, exist = keyToChildNode[d.ParamStr]
 		}
 		if !exist { // no wildcard node exist
 			return nil, nil
