@@ -3,6 +3,7 @@ package drain3
 import (
 	"fmt"
 	"os"
+	"context"
 )
 
 type FilePersistence struct {
@@ -13,7 +14,7 @@ func NewFilePersistence(filePath string) *FilePersistence {
 	return &FilePersistence{filePath: filePath}
 }
 
-func (p *FilePersistence) SaveState(state []byte) error {
+func (p *FilePersistence) Save(_ context.Context, state []byte) error {
 	if err := os.WriteFile(p.filePath, state, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
@@ -21,7 +22,7 @@ func (p *FilePersistence) SaveState(state []byte) error {
 	return nil
 }
 
-func (p *FilePersistence) LoadState() ([]byte, error) {
+func (p *FilePersistence) Load(_ context.Context) ([]byte, error) {
 	if _, err := os.Stat(p.filePath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
