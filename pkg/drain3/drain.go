@@ -40,6 +40,8 @@ type Drain struct {
 
 	IdToCluster     *lru.Cache[int64, *LogCluster] `json:"-"`
 	ClustersCounter int64
+
+	clusterLeaves map[int64]*Node
 }
 
 type optionFn func(*Drain)
@@ -98,7 +100,8 @@ func NewDrain(options ...optionFn) (*Drain, error) {
 
 	drain.MaxNodeDepth = drain.LogClusterDepth - 2 // max depth of a prefix tree node, starting from zero
 
-	l, err := lru.New[int64, *LogCluster](drain.MaxClusters)
+	drain.clusterLeaves = make(map[int64]*Node)
+	l, err := lru.NewWithEvict[int64, *LogCluster](drain.MaxClusters, drain.removeClusterFromTree)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lru-cache: %w", err)
 	}
@@ -279,20 +282,50 @@ func (d *Drain) getSeqDistance(seq1 []string, seq2 []string, includeParams bool)
 	return retVal, paramCount, nil
 }
 
+// removeClusterFromTree removes the secondary index entry as soon as the LRU
+// evicts its cluster, and prunes branches that no longer contain live clusters.
+// Removing empty exact paths can enable wildcard fallback on later searches.
+func (d *Drain) removeClusterFromTree(id int64, _ *LogCluster) {
+	node := d.clusterLeaves[id]
+	delete(d.clusterLeaves, id)
+	if node == nil {
+		return
+	}
+	for i, candidate := range node.ClusterIds {
+		if candidate == id {
+			copy(node.ClusterIds[i:], node.ClusterIds[i+1:])
+			node.ClusterIds = node.ClusterIds[:len(node.ClusterIds)-1]
+			break
+		}
+	}
+	for node.parent != nil && len(node.ClusterIds) == 0 && len(node.KeyToChildNode) == 0 {
+		parent := node.parent
+		delete(parent.KeyToChildNode, node.parentKey)
+		node = parent
+	}
+}
+
+func childNode(parent *Node, key string) *Node {
+	if child, ok := parent.KeyToChildNode[key]; ok {
+		return child
+	}
+	child := NewNode()
+	child.parent, child.parentKey = parent, key
+	parent.KeyToChildNode[key] = child
+	return child
+}
+
 func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 	tokenCount := len(cluster.LogTemplateTokens)
 	tokenCountStr := fmt.Sprint(tokenCount)
-	firstLayerNode, exist := rootNode.KeyToChildNode[tokenCountStr]
-	if !exist {
-		firstLayerNode = NewNode()
-		rootNode.KeyToChildNode[tokenCountStr] = firstLayerNode
-	}
+	firstLayerNode := childNode(rootNode, tokenCountStr)
 
 	currentNode := firstLayerNode
 
 	// handle case of empty log string
 	if tokenCount == 0 {
 		currentNode.ClusterIds = []int64{cluster.ClusterId}
+		d.clusterLeaves[cluster.ClusterId] = currentNode
 		return
 	}
 
@@ -300,7 +333,7 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 	for _, token := range cluster.LogTemplateTokens {
 		// if at max depth or this is last token in template - add current log cluster to the leaf node
 		if currentDepth >= d.MaxNodeDepth || currentDepth >= int64(tokenCount) {
-			// clean up stale clusters before adding a new one.
+			// Keep the existing insertion-path LRU touches for live clusters.
 			newClusterIds := []int64{}
 			for _, clusterId := range currentNode.ClusterIds {
 				if _, exist := d.IdToCluster.Get(clusterId); exist {
@@ -309,6 +342,7 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 			}
 			newClusterIds = append(newClusterIds, cluster.ClusterId)
 			currentNode.ClusterIds = newClusterIds
+			d.clusterLeaves[cluster.ClusterId] = currentNode
 			break
 		}
 
@@ -316,8 +350,7 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 		if _, existForToken := currentNode.KeyToChildNode[token]; !existForToken {
 			if d.ParametrizeNumericTokens && hasNumbers(token) {
 				if node, exist := currentNode.KeyToChildNode[d.ParamStr]; !exist {
-					newNode := NewNode()
-					currentNode.KeyToChildNode[d.ParamStr] = newNode
+					newNode := childNode(currentNode, d.ParamStr)
 					currentNode = newNode
 				} else {
 					currentNode = node
@@ -325,20 +358,17 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 			} else {
 				if node, exist := currentNode.KeyToChildNode[d.ParamStr]; exist {
 					if int64(len(currentNode.KeyToChildNode)) < d.MaxChildren {
-						newNode := NewNode()
-						currentNode.KeyToChildNode[token] = newNode
+						newNode := childNode(currentNode, token)
 						currentNode = newNode
 					} else {
 						currentNode = node
 					}
 				} else {
 					if int64(len(currentNode.KeyToChildNode)+1) < d.MaxChildren {
-						newNode := NewNode()
-						currentNode.KeyToChildNode[token] = newNode
+						newNode := childNode(currentNode, token)
 						currentNode = newNode
 					} else if int64(len(currentNode.KeyToChildNode)+1) == d.MaxChildren {
-						newNode := NewNode()
-						currentNode.KeyToChildNode[d.ParamStr] = newNode
+						newNode := childNode(currentNode, d.ParamStr)
 						currentNode = newNode
 					} else {
 						currentNode = currentNode.KeyToChildNode[d.ParamStr]
@@ -351,6 +381,26 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 		}
 
 		currentDepth++
+	}
+}
+
+// restoreTreeIndex reconnects transient parent/leaf indexes after loading a
+// snapshot and removes entries left behind by older versions of the library.
+func (d *Drain) restoreTreeIndex(node *Node) {
+	ids := node.ClusterIds[:0]
+	for _, id := range node.ClusterIds {
+		if _, ok := d.IdToCluster.Peek(id); ok {
+			ids = append(ids, id)
+			d.clusterLeaves[id] = node
+		}
+	}
+	node.ClusterIds = ids
+	for key, child := range node.KeyToChildNode {
+		child.parent, child.parentKey = node, key
+		d.restoreTreeIndex(child)
+		if len(child.ClusterIds) == 0 && len(child.KeyToChildNode) == 0 {
+			delete(node.KeyToChildNode, key)
+		}
 	}
 }
 
@@ -508,7 +558,11 @@ func (d *Drain) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	l, _ := lru.New[int64, *LogCluster](forJson.MaxClusters)
+	d.clusterLeaves = make(map[int64]*Node)
+	l, err := lru.NewWithEvict[int64, *LogCluster](forJson.MaxClusters, d.removeClusterFromTree)
+	if err != nil {
+		return err
+	}
 	for _, cluster := range forJson.Clusters {
 		l.Add(cluster.ClusterId, cluster)
 	}
@@ -524,6 +578,7 @@ func (d *Drain) UnmarshalJSON(data []byte) error {
 	d.ParametrizeNumericTokens = forJson.ParametrizeNumericTokens
 	d.IdToCluster = l
 	d.ClustersCounter = forJson.ClustersCounter
+	d.restoreTreeIndex(d.RootNode)
 
 	return nil
 }
@@ -546,6 +601,9 @@ type SerializableDrain struct {
 type Node struct {
 	KeyToChildNode map[string]*Node
 	ClusterIds     []int64
+
+	parent    *Node
+	parentKey string
 }
 
 func NewNode() *Node {

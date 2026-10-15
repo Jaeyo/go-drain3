@@ -12,6 +12,16 @@ to install go-drain3, run the following command:
 go get github.com/jaeyo/go-drain3
 ```
 
+## Cluster eviction
+
+`WithMaxCluster` limits the cached clusters and their prefix-tree entries. Evicting
+a cluster removes its tree entry and prunes branches with no live clusters.
+Loading a saved state also removes stale entries left by older versions.
+
+Pruning an empty exact-token branch can allow later messages to match an existing
+wildcard branch. Templates and cluster IDs after eviction can therefore differ
+from versions that retained those empty branches.
+
 ## Contribbuting
 go-drain3 is an open-source project. you can contribute in various ways, such as reporting bugs, requesting features, or imporoving the codebase.
 
